@@ -98,3 +98,48 @@ Report issues and enhancements in the https://issues.jenkins.io/[Jenkins issue t
 == Contributing
 
 Refer to our https://github.com/jenkinsci/.github/blob/master/CONTRIBUTING.md[contribution guidelines].
+
+=== Local build and test
+
+==== Building the artifact
+
+Run any of these commands from the repository root to publish the plugin artifact in `plugin/target/swarm.hpi`.
+
+Build, test, and publish the plugin artifact:
+
+[source,bash]
+----
+mvn install -pl plugin
+----
+
+Skipping the tests is sometimes desired:
+
+[source,bash]
+----
+mvn install -DskipTests -pl plugin
+----
+
+==== Running tests
+
+Run all the tests:
+
+[source,bash]
+----
+mvn -pl plugin test
+----
+
+Only run specific tests. E.g. to run only the tests in the `PluginImplTest` class, you can use this command:
+
+[source,bash]
+----
+mvn -pl plugin -Dtest=PluginImplTest test
+----
+
+=== Deploy the locally built plugin to a Jenkins controller
+
+For local development with frequent changes, rebuilding and re-uploading `plugin/target/swarm.hpi` is probably the quickest validation loop. Here is how:
+
+. Open `Manage Jenkins` -> `Plugins` -> `Advanced settings`.
+. In `Upload Plugin`, select `plugin/target/swarm.hpi` and upload it.
+. Restart Jenkins (or use `Manage Jenkins` -> `Reload Configuration from Disk` when appropriate).
+

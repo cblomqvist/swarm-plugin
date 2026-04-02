@@ -8,6 +8,7 @@ import hudson.model.Descriptor.FormException;
 import hudson.model.Node;
 import hudson.slaves.EnvironmentVariablesNodeProperty;
 import hudson.slaves.NodeProperty;
+import hudson.slaves.OfflineCause;
 import hudson.tools.ToolDescriptor;
 import hudson.tools.ToolInstallation;
 import hudson.tools.ToolLocationNodeProperty;
@@ -21,6 +22,11 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.slaves.JnlpAgentReceiver;
 import org.apache.commons.lang.ArrayUtils;
@@ -35,6 +41,8 @@ import org.kohsuke.stapler.verb.POST;
  * @author Kohsuke Kawaguchi
  */
 public class PluginImpl extends Plugin {
+
+    private static final Logger LOGGER = Logger.getLogger(PluginImpl.class.getName());
 
     private Node getNodeByName(String name, StaplerResponse2 rsp) throws IOException {
         Jenkins jenkins = Jenkins.get();
@@ -98,6 +106,23 @@ public class PluginImpl extends Plugin {
         return new LinkedHashSet<>(List.of(labels.split("\\s+")));
     }
 
+    private static boolean hasKeepDisconnectedClientsProperty(Node node) {
+        return node.getNodeProperty(KeepSwarmClientNodeProperty.class) != null;
+    }
+
+    private static void addKeepDisconnectedClientsProperty(Node node) throws IOException {
+        node.getNodeProperties().add(new KeepSwarmClientNodeProperty());
+        node.save();
+    }
+
+    private static void removeKeepDisconnectedClientsProperty(Node node) throws IOException {
+        KeepSwarmClientNodeProperty keepClientProp = node.getNodeProperty(KeepSwarmClientNodeProperty.class);
+        if (keepClientProp != null) {
+            node.getNodeProperties().remove(keepClientProp);
+            node.save();
+        }
+    }
+
     /** Remove labels from an agent. */
     @POST
     public void doRemoveSlaveLabels(
@@ -132,7 +157,7 @@ public class PluginImpl extends Plugin {
             @QueryParameter(fixEmpty = true) String hash,
             @QueryParameter boolean deleteExistingClients,
             @QueryParameter boolean keepDisconnectedClients)
-            throws IOException {
+            throws IOException, InterruptedException {
         Jenkins jenkins = Jenkins.get();
 
         jenkins.checkPermission(Computer.CREATE);
@@ -179,18 +204,88 @@ public class PluginImpl extends Plugin {
 
         // Check for existing connections.
         Node node = jenkins.getNode(name);
-        if (node != null && !deleteExistingClients) {
+        if (node != null) {
+            /*
+             * The node already exists. The behaviour depends on deleteExistingClients:
+             *
+             *  - false (same-host reconnection): preserve the existing node so that
+             *    running builds survive. Disconnect any stale channel/WebSocket session
+             *    so that WebSocketAgents#doIndex no longer rejects the new connection
+             *    with "already connected", then return the existing node's secret.
+             *
+             *  - true  (agent replacement): disconnect the stale channel, then remove
+             *    the old node and fall through to create a brand-new SwarmSlave.
+             *
+             * computer.disconnect() returns a Future; we wait synchronously (up to 15 s)
+             * for it to complete, matching the pattern used by
+             * DefaultJnlpSlaveReceiver#afterProperties.
+             */
+            boolean addedKeepDisconnectedClientsPropertyForReconnect = false;
+            boolean hadKeepDisconnectedClientsProperty = hasKeepDisconnectedClientsProperty(node);
             Computer computer = node.toComputer();
+            if (!deleteExistingClients && !hadKeepDisconnectedClientsProperty) {
+                LOGGER.log(
+                        Level.INFO,
+                        "Temporarily marking agent \"{0}\" to be kept across disconnect so the existing node can be reused.",
+                        name);
+                addKeepDisconnectedClientsProperty(node);
+                addedKeepDisconnectedClientsPropertyForReconnect = true;
+            }
             if (computer != null && computer.isOnline()) {
-                /*
-                 * This is an existing connection. We'll only cause issues if we trample over an
-                 * online connection.
-                 */
-                rsp.setStatus(HttpServletResponse.SC_CONFLICT);
-                rsp.setContentType("text/plain; UTF-8");
-                rsp.getWriter().printf("Agent \"%s\" is already created and on-line.%n", name);
+                LOGGER.log(Level.INFO, "Disconnecting stale channel for agent \"{0}\" to allow reconnection.", name);
+                try {
+                    computer.disconnect(new OfflineCause() {
+                                @Override
+                                public String toString() {
+                                    return "Swarm client is reconnecting";
+                                }
+                            })
+                            .get(15, TimeUnit.SECONDS);
+                } catch (ExecutionException | TimeoutException e) {
+                    LOGGER.log(
+                            Level.WARNING,
+                            "Timed out waiting for agent \"" + name + "\" to go offline. "
+                                    + "The new connection may be rejected by WebSocketAgents.",
+                            e);
+                }
+            }
+
+            if (addedKeepDisconnectedClientsPropertyForReconnect) {
+                if (computer == null || computer.getChannel() == null) {
+                    LOGGER.log(
+                            Level.INFO,
+                            "Removing temporarily KeepSwarmClientNodeProperty for agent \"{0}\" to preserve desired behavior.",
+                            name);
+                    removeKeepDisconnectedClientsProperty(node);
+                } else {
+                    LOGGER.log(
+                            Level.WARNING,
+                            "Agent \"{0}\" is still connected after the reconnect disconnect attempt. "
+                                    + "Leaving KeepSwarmClientNodeProperty in place to avoid node removal.",
+                            name);
+                }
+            }
+
+            if (!deleteExistingClients) {
+                // Preserve the existing node — return its secret so the client
+                // reconnects to the same Computer and running builds to resume.
+                LOGGER.log(
+                        Level.INFO,
+                        "Option '-deleteExistingClients' not set. Preserving existing node for agent \"{0}\" to allow running builds to resume.",
+                        name);
+                rsp.setContentType("text/plain; charset=iso-8859-1");
+                try (OutputStream outputStream = rsp.getOutputStream()) {
+                    Properties props = new Properties();
+                    props.put("name", name);
+                    props.put("secret", JnlpAgentReceiver.SLAVE_SECRET.mac(name));
+                    props.store(outputStream, "");
+                }
                 return;
             }
+
+            // deleteExistingClients — remove the old node, then fall through to
+            // create a fresh SwarmSlave below.
+            jenkins.removeNode(node);
         }
 
         try {
@@ -198,6 +293,8 @@ public class PluginImpl extends Plugin {
             if (description != null) {
                 nodeDescription += ": " + description;
             }
+            LOGGER.log(
+                    Level.INFO, "Setting up new agent: \"{0}\", possibly replacing existing agent.", nodeDescription);
             SwarmSlave agent = new SwarmSlave(
                     name,
                     nodeDescription,
